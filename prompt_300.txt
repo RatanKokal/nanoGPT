@@ -1,0 +1,1 @@
+Provide a detailed explanation of entropy covering thermodynamics, statistical mechanics, and information theory. Include intuitive analogies, mathematical intuition (without heavy equations), real-world examples, and common misconceptions students have about entropy.

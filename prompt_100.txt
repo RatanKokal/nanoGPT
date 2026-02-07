@@ -1,0 +1,1 @@
+Explain entropy from both a physics and information theory perspective, with a small intuitive example for each.
