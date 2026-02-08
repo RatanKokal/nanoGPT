@@ -41,6 +41,7 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        self.block_size = config.block_size
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         self.flash = False
@@ -50,23 +51,57 @@ class CausalSelfAttention(nn.Module):
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
-    def forward(self, x):
+    def forward(self, x, step, k_cache, v_cache):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
+        # x_T = x[:, [-1], :]
 
-        # calculate query, key, values for all heads in batch and move head forward to be the batch dim
-        q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        q, k, v  = self.c_attn(x[:, -T:, :]).split(self.n_embd, dim=2)
+        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, steps, hs)
+        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, steps, hs)
+        k_cache[:, :, step - T:step, :] = k
+        v_cache[:, :, step - T:step, :] = v
+        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, steps, hs)
+        v = v_cache[:, :, max(step - self.block_size, 0):step, :]
+        k = k_cache[:, :, max(step - self.block_size, 0):step, :]
 
-        # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
+        # if not self.flag:
+        #     q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        #     k_cache[:, :T, :] = k
+        #     v_cache[:, :T, :] = v
+        #     q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) 
+        #     self.flag = True
+        # else:
+        #     q, new_k, new_v = self.c_attn(x[:, [-1], :]).split(self.n_embd, dim=2)
+        #     k_cache[:, T-1:] = new_k
+        #     v_cache[:, T-1:] = new_v
+        #     q = q.view(B, 1, self.n_head, C // self.n_head).transpose(1, 2)
+
+        
+        # # if self.k_cache is None:
+        # #     self.k_cache = torch.empty(self.n_head, T, C // self.n_head)
+        # # if self.v_cache is None:
+        # #     self.v_cache = torch.empty(self.n_head, T, C // self.n_head)
+
+        # k = k_cache[:, :T, :]
+        # v = v_cache[:, :T, :]
+        # # calculate query, key, values for all heads in batch and move head forward to be the batch dim
+        # # q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
+        # k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        # # q = q.view(B, 1, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        # v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+        # # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
         if self.flash:
             # efficient attention using Flash Attention CUDA kernels
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
         else:
             # manual implementation of attention
+            # custom implementation of kv cache begins
+
+
+            # custom implementation of kv cache ends
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
-            att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
+            if T > 1:
+                att = att.masked_fill(self.bias[:,:,min(step, self.block_size)-T:min(step, self.block_size),:min(step, self.block_size)] == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
@@ -101,8 +136,8 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x):
-        x = x + self.attn(self.ln_1(x))
+    def forward(self, x, step, k_cache, v_cache):
+        x = x + self.attn(self.ln_1(x), step, k_cache, v_cache)
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -168,18 +203,25 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, targets=None):
+    def forward(self, idx, T, step, targets=None):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        pos = torch.arange(0, t, dtype=torch.long, device=device) # shape (t)
-
+        if T == 1:
+            pos = torch.tensor([min(self.config.block_size - 1, step - 1)], device=device)
+        else:
+            pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
+        if T == 1:
+            idx = idx[:, -1:]
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
         x = self.transformer.drop(tok_emb + pos_emb)
-        for block in self.transformer.h:
-            x = block(x)
+
+        # print(x.shape)
+
+        for layer_no, block in enumerate(self.transformer.h):
+            x = block(x, step, self.k_cache[layer_no], self.v_cache[layer_no])
         x = self.transformer.ln_f(x)
 
         if targets is not None:
@@ -310,11 +352,22 @@ class GPT(nn.Module):
         the sequence max_new_tokens times, feeding the predictions back into the model each time.
         Most likely you'll want to make sure to be in model.eval() mode of operation for this.
         """
-        for _ in range(max_new_tokens):
+        for t in range(max_new_tokens):
             # if the sequence context is growing too long we must crop it at block_size
             idx_cond = idx if idx.size(1) <= self.config.block_size else idx[:, -self.config.block_size:]
-            # forward the model to get the logits for the index in the sequence
-            logits, _ = self(idx_cond)
+
+            #print(idx_cond.shape)
+            if t == 0:
+                B, T = idx_cond.size()
+                C = self.config.n_embd
+                self.k_cache = torch.empty(self.config.n_layer, B, self.config.n_head, T + max_new_tokens, C // self.config.n_head, device=idx_cond.device, dtype=torch.float32)
+                self.v_cache =  torch.empty(self.config.n_layer, B, self.config.n_head, T + max_new_tokens, C // self.config.n_head, device=idx_cond.device, dtype=torch.float32)
+                logits, _ = self(idx_cond, T, idx.size(1))
+            else:
+                logits, _ = self(idx_cond, 1, idx.size(1))
+
+            # # forward the model to get the logits for the index in the sequence
+            # logits, _ = self(idx_cond)
             # pluck the logits at the final step and scale by desired temperature
             logits = logits[:, -1, :] / temperature
             # optionally crop the logits to only the top k options
