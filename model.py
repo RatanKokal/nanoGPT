@@ -41,7 +41,6 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
-        self.block_size = config.block_size
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         self.flash = False
@@ -49,20 +48,20 @@ class CausalSelfAttention(nn.Module):
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
             # causal mask to ensure that attention is only applied to the left in the input sequence
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
-                                        .view(1, 1, config.block_size, config.block_size))
+                                        .contiguous().view(1, 1, config.block_size, config.block_size))
 
     def forward(self, x, step, k_cache, v_cache):
         B, T, C = x.size() # batch size, sequence length, embedding dimensionality (n_embd)
         # x_T = x[:, [-1], :]
 
         q, k, v  = self.c_attn(x[:, -T:, :]).split(self.n_embd, dim=2)
-        k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, steps, hs)
-        v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, steps, hs)
+        k = k.contiguous().view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, steps, hs)
+        v = v.contiguous().view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, steps, hs)
         k_cache[:, :, step - T:step, :] = k
         v_cache[:, :, step - T:step, :] = v
-        q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, steps, hs)
-        v = v_cache[:, :, max(step - self.block_size, 0):step, :]
-        k = k_cache[:, :, max(step - self.block_size, 0):step, :]
+        q = q.contiguous().view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, steps, hs)
+        v = v_cache[:, :, :step, :]
+        k = k_cache[:, :, :step, :]
 
         # if not self.flag:
         #     q, k, v  = self.c_attn(x).split(self.n_embd, dim=2)
@@ -100,8 +99,10 @@ class CausalSelfAttention(nn.Module):
 
             # custom implementation of kv cache ends
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
+            # Apply causal mask BEFORE softmax
             if T > 1:
-                att = att.masked_fill(self.bias[:,:,min(step, self.block_size)-T:min(step, self.block_size),:min(step, self.block_size)] == 0, float('-inf'))
+                mask = self.bias[:, :, :T, :T]
+                att = att.masked_fill(mask == 0, float('-inf'))
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
@@ -136,8 +137,8 @@ class Block(nn.Module):
         self.ln_2 = LayerNorm(config.n_embd, bias=config.bias)
         self.mlp = MLP(config)
 
-    def forward(self, x, step, k_cache, v_cache):
-        x = x + self.attn(self.ln_1(x), step, k_cache, v_cache)
+    def forward(self, x, steps, k_cache, v_cache):
+        x = x + self.attn(self.ln_1(x), steps, k_cache, v_cache)
         x = x + self.mlp(self.ln_2(x))
         return x
 
@@ -203,16 +204,11 @@ class GPT(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
 
-    def forward(self, idx, T, step, targets=None):
+    def forward(self, idx, step, targets=None):
         device = idx.device
         b, t = idx.size()
         assert t <= self.config.block_size, f"Cannot forward sequence of length {t}, block size is only {self.config.block_size}"
-        if T == 1:
-            pos = torch.tensor([min(self.config.block_size - 1, step - 1)], device=device)
-        else:
-            pos = torch.arange(0, t, dtype=torch.long, device=device).unsqueeze(0) # shape (1, t)
-        if T == 1:
-            idx = idx[:, -1:]
+        pos = step - t + torch.arange(t, dtype=torch.long, device=device) # shape (t)
         # forward the GPT model itself
         tok_emb = self.transformer.wte(idx) # token embeddings of shape (b, t, n_embd)
         pos_emb = self.transformer.wpe(pos) # position embeddings of shape (t, n_embd)
@@ -227,7 +223,7 @@ class GPT(nn.Module):
         if targets is not None:
             # if we are given some desired targets also calculate the loss
             logits = self.lm_head(x)
-            loss = F.cross_entropy(logits.view(-1, logits.size(-1)), targets.view(-1), ignore_index=-1)
+            loss = F.cross_entropy(logits.contiguous().view(-1, logits.size(-1)), targets.contiguous().view(-1), ignore_index=-1)
         else:
             # inference-time mini-optimization: only forward the lm_head on the very last position
             logits = self.lm_head(x[:, [-1], :]) # note: using list [-1] to preserve the time dim
@@ -360,11 +356,13 @@ class GPT(nn.Module):
             if t == 0:
                 B, T = idx_cond.size()
                 C = self.config.n_embd
-                self.k_cache = torch.empty(self.config.n_layer, B, self.config.n_head, T + max_new_tokens, C // self.config.n_head, device=idx_cond.device, dtype=torch.float32)
-                self.v_cache =  torch.empty(self.config.n_layer, B, self.config.n_head, T + max_new_tokens, C // self.config.n_head, device=idx_cond.device, dtype=torch.float32)
-                logits, _ = self(idx_cond, T, idx.size(1))
+                # Match cache dtype to model's dtype for consistency
+                cache_dtype = next(self.parameters()).dtype
+                self.k_cache = torch.zeros(self.config.n_layer, B, self.config.n_head, T + max_new_tokens, C // self.config.n_head, device=idx_cond.device, dtype=cache_dtype)
+                self.v_cache =  torch.zeros(self.config.n_layer, B, self.config.n_head, T + max_new_tokens, C // self.config.n_head, device=idx_cond.device, dtype=cache_dtype)
+                logits, _ = self(idx_cond, T + t)
             else:
-                logits, _ = self(idx_cond, 1, idx.size(1))
+                logits, _ = self(idx_cond[:, -1:], T + t)
 
             # # forward the model to get the logits for the index in the sequence
             # logits, _ = self(idx_cond)
@@ -375,9 +373,10 @@ class GPT(nn.Module):
                 v, _ = torch.topk(logits, min(top_k, logits.size(-1)))
                 logits[logits < v[:, [-1]]] = -float('Inf')
             # apply softmax to convert logits to (normalized) probabilities
-            probs = F.softmax(logits, dim=-1)
+            probs = F.softmax(logits.to("cpu"), dim=-1)
             # sample from the distribution
             idx_next = torch.multinomial(probs, num_samples=1)
+            idx_next = idx_next.to(idx.device)
             # append sampled index to the running sequence and continue
             idx = torch.cat((idx, idx_next), dim=1)
 
